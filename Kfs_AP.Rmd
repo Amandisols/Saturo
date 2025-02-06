@@ -1,0 +1,420 @@
+---
+title: "Saturo Calculations & Data Validation"
+author: "Amanda Pennino, Dylan Casey"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    number_sections: true
+    code_folding: show
+    toc: true
+    toc_float: true
+  pdf_document: default
+---
+```{r, warning=FALSE, message=FALSE, class.source = "fold-show"}
+# Still to address
+### Determination of high/low pressure periods could be changed so that it is not tied to a fixed number (6 cm) but instead references either high/low P setting from the summary tab or determines it based on the soak time and hold time. Soak time/hold time might be a good approach since that is how the saturo decides when to change the pressure target. That way, if there is an issue hitting a target pressure (e.g. if the unit runs out of water), that will still be caught in the validation metrics (Kfs error/water level sd). This will also make the code more robust to unit changes if somebody sets pressure units to mm.
+### Add annotation to the visual validation
+### NASIS uploader sheet? Later..
+
+```
+
+\
+
+# Introduction
+Saturo is an automated single-ring infiltrometer manufactured by Meter Group. The Saturo infiltrometer estimates field-saturated hydraulic conductivity (Kfs) and associated error (Kfs error) using the two-ponding head approach developed by Reynolds and Elrick (1990). Saturo accomplishes this by maintaining a constant pond of water on the soil surface and using a water pump and an air pump in combination to cycle between high- and low-pressure heads. Saturo uses an internal processor to perform the Kfs calculations and field data can be downloaded from the instrument in .csv or .xlsx format. Kfs and Kfs error can be estimated from each respective pressure cycle, allowing for multiple opportunities to estimate Kfs and Kfs error from a single run with the instrument. However, the Saturo is currently programmed to only use the last pressure cycle of a run to calculate the Kfs and Kfs error results. The last pressure cycle of a run can contain noisy or irregular data, resulting in erroneous estimations of Kfs and Kfs error. This document provides a method to calculate Kfs and Kfs error for every cycle of a Saturo run. The code is broken up into chunks with annotations to explain each step of the calculation.
+
+\
+
+# Require R packages
+
+The following R packages must be installed and loaded into the current R session: `tidyverse`, `readxl`, and `formattable`.
+
+## Install required R packages
+```{r}
+# install.packages('tidyverse')
+# install.packages('readxl')
+# install.packages('formattable')
+```
+\
+
+##  Load required packages into current R session
+**Ensure that you have these packages installed prior to running the code.** 
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(readxl)
+library(formattable)
+library(ggtern) # for Textural triangle boundaries
+library(soilDB) # for Rosetta
+
+```
+
+\
+
+# Bring in your data 
+
+**Note: this script assumes that your Saturo data has been downloaded as an MS Excel file (.xlsx file extension).**
+
+The Saturo output file (MS Excel format) contains two sheets that are used in the following R code: "Summary" and "Raw Data". The Summary sheet contains metadata for the Saturo run including the device serial number, test name, start time, stop time, estimated Kfs and Kfs error, and the settings for the test. The Raw Data sheet contains the raw sensor data including the water level, head pressure, flux, and volume of water dispensed by the water pump.\
+\
+**Change the path directory to where the file is stored** (file_path) \
+**Change the name of the file to the one of interest ** (file_name)
+
+```{r, warning=FALSE, message=FALSE, class.source='bg-warning'}
+# Change directory to the file you want to analyze
+file_path = "C:/Users/Amanda.Pennino/OneDrive - USDA/Documents/methods/Saturo/data/"
+file_name = "Run1.xlsx"
+
+# Bring in your data
+dat <- read_excel(paste0(file_path, file_name), sheet = "Raw Data")
+
+```
+
+\
+
+# Calculations
+## Extract metadata
+```{r, warning=FALSE, message=FALSE}
+
+# Create summary of run settings
+## There will be a warning message that shows regarding column data types
+summary <- read_excel(paste0(file_path, file_name), 
+                      sheet = "Summary",
+                      col_names = c("Settings", "Value"),
+                      skip = 2,
+                      col_types = c("guess", "numeric"))
+
+
+
+# Reformat summary to wide format
+summary <- summary %>% 
+  drop_na(Settings) %>%
+  spread(key = Settings, value = Value)
+
+# Extract out units of measurement
+## This is set on the control unit prior to the run. This code executes pattern matching to grab anything with paratheses into a seperate column.
+units <- data.frame(names = names(summary)) %>% 
+  mutate(units = str_extract(.[[1]], "(?<=\\()([^()]*?)(?=\\)[^()]*$)")) %>%
+  mutate(names = str_replace(.[[1]], " \\s*\\([^\\)]+\\)", "")) 
+
+units2 <- data.frame(names = names(dat)) %>%
+  mutate(units = str_extract(.[[1]], "(?<=\\()([^()]*?)(?=\\)[^()]*$)")) %>%
+  mutate(names = str_replace(.[[1]], " \\s*\\([^\\)]+\\)", "")) 
+
+units <- rbind(units, units2)
+
+#Change column names in the data sheet to take out units of measurement
+names(dat) <- units2[[1]]
+rm(units2) #remove data frame
+
+
+# Extract variables for calculations
+presoak <- summary[[1,16]]
+hold <- summary[[1,5]]
+depth <- summary[[1,7]] # Ring depth
+cycles <- summary[[1,10]] 
+radius <- 7.5  # Ring radius
+delta <- round((0.993 * depth) + (0.578 * radius), digits = 1)  # Calculate delta (ring geometry/shape factor)
+p_Kfs <- summary[[1,8]]
+p_Kfs_error <- summary[[1,9]]
+```
+
+\
+
+## Determine high/low pressure periods
+```{r, warning=FALSE, message=FALSE}
+
+# Determine high/low pressure periods
+dat <- dat %>%
+  mutate(setting = ifelse(Time <= presoak, "presoak", 
+                          ifelse(Pressure > 6, "high", 
+                                 ifelse(Pressure < 6, "low", NA) ))) 
+
+nhigh <- as.numeric(nrow(dat[dat$setting == "high",])) 
+nlow <- as.numeric(nrow(dat[dat$setting == "low",]))
+
+
+# Add cycle numbers
+dat <- dat %>%
+  group_by(setting) %>%
+  mutate(cycle = ifelse(setting == "presoak", 0,
+                        ifelse(setting == "high", rep(c(1:cycles), each = nhigh/cycles, length.out = n()), 
+                               ifelse(setting == "low", rep(c(1:cycles), each = nlow/cycles, length.out = n()), NA)))) %>%
+  ungroup() %>%
+  group_by(cycle, setting) %>%
+  slice(3:n()) #takes out the first 2 minutes of each pressure setting for every cycle
+```
+
+\
+
+## Calculate the Kfs, Kfs error, and water level standard deviation for each cycle
+```{r, warning=FALSE, message=FALSE}
+
+# Calculate the Kfs & Kfs error for each cycle
+## Kfs
+Kfs <- dat %>%
+  filter(setting != "presoak") %>%
+  group_by(setting, cycle) %>%
+  summarise(mFlux = mean(Flux),
+            mPress = mean(Pressure)) %>%
+  pivot_wider(names_from = setting, values_from = c(mFlux, mPress)) %>%
+  mutate(Kfs = (delta * (mFlux_high - mFlux_low)) / (mPress_high - mPress_low)) %>%
+  select(cycle, Kfs)
+
+
+## Kfs error
+high <- dat %>%
+  filter(setting == "high") %>%
+  group_by(setting) %>%
+  rename(highP = Pressure,
+         highQ = Flux) %>%
+  ungroup()%>%
+  select(highP, highQ, cycle)
+  
+low <- dat %>%
+  filter(setting == "low") %>%
+  group_by(setting) %>%
+  rename(lowP = Pressure,
+         lowQ = Flux) %>%
+  ungroup()%>%
+  select(lowP, lowQ)
+
+dat2 <- cbind(high, low)
+dat2 <- left_join(dat2, Kfs, by = "cycle")
+
+Kfs_error <- dat2 %>%
+  mutate(row_Kfs = (delta * (highQ - lowQ)) / (highP-lowP),
+         row_error = (row_Kfs - Kfs)^2 ) %>%
+  group_by(cycle) %>%
+  summarise(Kfs_error = sqrt(sum(row_error)) / (hold - 2) )
+
+Kfs_data <- left_join(Kfs, Kfs_error, by = "cycle")
+
+
+## Standard Deviation of water level
+sd_waterlevel <- dat %>%
+  filter(cycle != 0) %>%
+  group_by(cycle) %>%
+  summarise(sd = sd(`Water Level`))
+
+Kfs_data <- left_join(Kfs_data, sd_waterlevel, by = "cycle")
+
+```
+
+\
+
+# View the calculated results by cycle
+## Run validation tests
+
+**Calculated test:** A check if the newly calculated Kfs value is the same as the programmed Kfs value. If the last cycle value does not pass this test then there may be an issue with this calculation.
+\
+\
+**Range test:** A check if the Kfs value falls within an expected range of Ksat values for that soil texture. This is acheived by running the Rosetta pedotransfer function for theoretical high/low values of soil particle size distribution and high/low values of bulk density (1.0-2.0 g/cm3). If this test is not passed, consider other factors that impact water flow (e.g., soil structure, organic matter content) that could push it outside the expected Ksat range.
+\
+\
+**Error test:** A check that the Kfs standard error is at least one order of magnitude smaller than the measured Kfs value. Smaller values indicate smaller error for that cycle. 
+\
+\
+**Water level test:** A check of the variability of the water level in the chamber. The standard deviation is calculated by each cycle. Smaller values indicate smaller water lever variation for that cycle. The threshold for this test is set at 0.25 cm and can be manually changed. 
+\
+\
+
+**A "Yes" means the test is passed, while "No" means it did not.**
+
+```{r, warning=FALSE, message=FALSE}
+
+# CALCULATED TEST: 
+  p_Kfs <- signif(p_Kfs, 3)
+  Kfs_data$Kfs <- signif(Kfs_data[[2]], 3)
+  Kfs_data$calc_check <- Kfs_data$Kfs == p_Kfs
+
+  
+  
+# RANGE TEST: 
+  # get boundaries for each soil texture to address the extreme values
+  data(USDA)
+
+  # convert S, Si, C % to whole numbers and add theoretical low/high Db
+  USDA <- USDA %>%  
+    mutate(across(c(Sand, Silt, Clay), function(x) x*100)) %>%
+    mutate(Db_low = 0.9, Db_high = 2.2)
+
+  # assign variables and run Rosetta. Output ksat = log10(cm/day)
+  vars1 = c('Sand', 'Silt', 'Clay', 'Db_low')
+  r1 <- ROSETTA(USDA, vars = vars1)
+  
+  vars2 = c('Sand', 'Silt', 'Clay', 'Db_high')
+  r2 <- ROSETTA(USDA, vars = vars2)
+
+  # extract out min/max
+  low_r <- r1 %>%
+    group_by(Label) %>%
+    summarise(ksat_min = min(ksat))
+  
+  high_r <- r2 %>%
+    group_by(Label) %>%
+    summarise(ksat_max = max(ksat))
+
+  ranges <- left_join(low_r, high_r, by = "Label")
+
+  # convert to cm/sec
+   ranges <- ranges %>%  
+     mutate(across(c(ksat_min, ksat_max), function(x) (10^(x))/86400))
+   
+  # match units selected for the run. 
+  # possible units: cm/s, cm/hr, in/s, in/hr
+  ksat_units = units$units[units$names == "Kfs"]
+  
+  #unit conversions
+  convert_units <- function(data, target_units) {
+    inches_per_cm = 0.393701
+    seconds_per_hour = 3600
+
+  # conversions
+  if(target_units == "cm/hr") {
+    data$ksat_min <- data$ksat_min * seconds_per_hour
+    data$ksat_max <- data$ksat_max * seconds_per_hour
+  } else if (target_units == "in/s"){
+    data$ksat_min <- data$ksat_min * inches_per_cm
+    data$ksat_max <- data$ksat_max * inches_per_cm
+  } else if (target_units == "in/hr"){
+    data$ksat_min <- data$ksat_min * inches_per_cm * seconds_per_hour
+    data$ksat_max <- data$ksat_max * inches_per_cm * seconds_per_hour
+  } else {
+    stop("Unsupported units specified.")
+  }
+    return(data)
+  }
+  
+  # Perform conversion if necessary. 
+  if(ksat_units!="cm/s"){
+    ranges <- convert_units(ranges, ksat_units)
+  }
+
+  # pull out range by specific texture
+  texture = "Sand"
+  low <- ranges$ksat_min[ranges$Label == texture]
+  high <- ranges$ksat_max[ranges$Label == texture]
+  Kfs_data$range_check <- between(Kfs_data$Kfs, low, high)    
+
+  
+# MAGNITUDE TEST: 
+  Kfs_data$mag_check <- (Kfs_data$Kfs / Kfs_data$Kfs_error) >= 10
+
+  
+  
+# WATER LEVEL TEST:
+  wl_units = units$units[units$names == "Water Level"]
+  sd_threshold = 0.25 #cm  
+  
+  convert_units2 <- function(threshold, target_units) {
+    inches_per_cm = 0.393701
+    millimeters_per_cm = 10
+
+  # conversions
+  if(target_units == "mm") {
+    threshold = threshold * millimeters_per_cm
+  } else if (target_units == "in"){
+    threshold = threshold * inches_per_cm
+  } else {
+    stop("Unsupported units specified.")
+  }
+    return(data)
+  }
+  
+  # Perform conversion if necessary. 
+  if(wl_units!="cm"){
+    ranges <- convert_units2(sd_threshold, wl_units)
+  }
+  
+  #Perform test
+  Kfs_data$level_check <- Kfs_data$sd <= sd_threshold
+
+```
+
+## Tabluate results
+```{r, warning=FALSE, message=FALSE}
+# Rename columns
+names(Kfs_data) <- c("Cycle", 
+                     paste0("Kfs (", units$units[units$names == "Kfs"], ")"), 
+                     paste0("Kfs Error (", units$units[units$names == "Kfs Error"], ")"),
+                     paste0("Water Level SD (", units$units[units$names == "Water Level"], ")"),
+                     "Calculated Test",
+                     "Range Test",
+                     "Error Test", 
+                     "Water Level Test")
+
+# Change column order
+Kfs_data <- Kfs_data[,c(1,4,3,2,5,6,7,8)]
+
+# Change view of data to scientific notation with 3 significant digits
+## Preserve original table first
+Kfs_table <- Kfs_data
+
+Kfs_table[[3]] <- formatC(Kfs_table[[3]], format = "e", 2)
+Kfs_table[[4]] <- formatC(Kfs_table[[4]], format = "e", 2)
+Kfs_table[[2]] <- signif(Kfs_table[[2]], 2)
+
+# Create chart that shows the results of the validation tests
+t <- formattable(Kfs_table,
+  align = c("c","c","c","c","c","c", "c"),
+  list("Cycle" = formatter("span", style = ~ style(color = "black", font.weight = "bold")),
+  `Calculated Test` = formatter("span",
+  x ~ icontext(ifelse(x == "TRUE", "ok", "remove"), ifelse(x == "TRUE", "Yes", "No")),
+  style = x ~ style(color = ifelse(x != "TRUE", "red", "green"))), 
+  `Range Test` = formatter("span",
+  x ~ icontext(ifelse(x == "TRUE", "ok", "remove"), ifelse(x == "TRUE", "Yes", "No")),
+  style = x ~ style(color = ifelse(x != "TRUE", "red", "green"))),
+  `Error Test` = formatter("span",
+  x ~ icontext(ifelse(x == "TRUE", "ok", "remove"), ifelse(x == "TRUE", "Yes", "No")),
+  style = x ~ style(color = ifelse(x != "TRUE", "red", "green"))),
+  `Water Level Test` = formatter("span",
+  x ~ icontext(ifelse(x == "TRUE", "ok", "remove"), ifelse(x == "TRUE", "Yes", "No")),
+  style = x ~ style(color = ifelse(x != "TRUE", "red", "green")))))
+
+t
+
+```
+
+\
+
+## Visually inspect data
+```{r, warning=FALSE, message=FALSE, fig.width=7, fig.height=7}
+
+# Bring in the raw data again
+raw <- read_excel(paste0(file_path, file_name), sheet = "Raw Data")
+names(raw)[2] <- "Time"
+
+# Pivot the dataframe to long format
+raw_long <- raw %>%
+  ungroup() %>%
+  select(-`Record ID`) %>%
+  pivot_longer(!Time, names_to = "metric", values_to = "value")
+
+# Plot
+p <- raw_long %>%
+  ggplot(aes(Time, value)) +
+  geom_line(aes(color = metric), size = 1) +
+  facet_grid(metric~., scales = "free_y", switch = "y") +
+  ylab(" ") +
+  scale_colour_brewer(type = "div") +
+  theme_bw()+
+  theme(strip.text.y = element_text(size = 10, hjust = 0.5,
+          vjust = 0.5, face = 'bold')) +
+  theme(legend.title=element_blank())
+
+p
+```
+
+
+\ 
+
+# Export your results \
+**This will be saved as a .csv file in the same location as where the original datasheet was.**
+```{r, class.source='bg-warning'}
+
+#Export data as a .csv file
+write.csv(Kfs_data, paste0(file_path, "Results_", file_name))
+
+```
+
+
